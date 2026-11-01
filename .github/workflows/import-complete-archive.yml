@@ -2,6 +2,9 @@ name: Import complete uploaded archive
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/import-complete-archive.yml]
 
 permissions:
   contents: write
@@ -24,66 +27,76 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Check out transfer data
+      - name: Check out verified transfer data
         uses: actions/checkout@v4
         with:
-          ref: archive-transfer-20261101
+          ref: complete-site-transfer-20261101
           path: .archive-transfer
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Extract every original file and commit
+      - name: Restore every original path and verify its Git object
         id: import
         env:
-          EXPECTED_SHA256: 8df668d3f28a54a55fd074efd60a736b7758b99e1140514e21611f8589bb31a9
-          EXPECTED_FILES: "33086"
+          EXPECTED_SHA256: 24b6ccb6902ff88d4aee9eea69b660d477719deb95a57a72d67b6dfb2735564b
+          SOURCE_COMMIT: 350ade71518c673565dd90cfa45509c91097ee0a
+          EXPECTED_ORIGINAL_FILES: "33086"
         shell: python
         run: |
           import hashlib, os, shutil, subprocess
-          from pathlib import Path, PurePosixPath
-          from zipfile import ZipFile
+          from pathlib import Path
 
           root = Path.cwd()
           temporary = Path(os.environ["RUNNER_TEMP"])
-          archive = temporary / "original-upload.zip"
+          bundle = temporary / "complete-site.bundle"
           parts = sorted((root / ".archive-transfer" / "parts").glob("part-*"))
-          assert parts, "No archive parts"
-          with archive.open("wb") as output:
+          assert parts, "Missing transfer parts"
+          digest = hashlib.sha256()
+          with bundle.open("wb") as output:
               for part in parts:
                   with part.open("rb") as source:
-                      shutil.copyfileobj(source, output)
-          checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
-          assert checksum == os.environ["EXPECTED_SHA256"], "Archive checksum mismatch"
-          site = temporary / "complete-extracted-site"
-          site.mkdir(exist_ok=True)
-          with ZipFile(archive) as source:
-              entries = source.infolist()
-              names = [entry.filename for entry in entries if not entry.is_dir()]
-              assert len(names) == int(os.environ["EXPECTED_FILES"])
-              assert len(names) == len(set(names)), "Duplicate archive paths"
-              for entry in entries:
-                  path = PurePosixPath(entry.filename)
-                  assert not path.is_absolute() and ".." not in path.parts and ".git" not in path.parts
-              source.extractall(site)
-              for name in names:
-                  target = root / name
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copy2(site / name, target)
-                  assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(source.read(name)).digest()
+                      while data := source.read(1024 * 1024):
+                          digest.update(data)
+                          output.write(data)
+          assert digest.hexdigest() == os.environ["EXPECTED_SHA256"], "Transfer checksum mismatch"
+          source_commit = os.environ["SOURCE_COMMIT"]
+          subprocess.run(["git", "bundle", "verify", str(bundle)], check=True)
+          subprocess.run(["git", "fetch", str(bundle), "HEAD:refs/remotes/upload/source"], check=True)
+          received = subprocess.check_output(["git", "rev-parse", "refs/remotes/upload/source"]).decode().strip()
+          assert received == source_commit, "Unexpected source commit"
+          shutil.rmtree(root / ".archive-transfer")
           subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
           subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
-          for offset in range(0, len(names), 200):
-              subprocess.run(["git", "add", "-f", "--", *names[offset:offset + 200]], check=True)
-          subprocess.run(["git", "rm", "--", ".github/workflows/import-complete-archive.yml"], check=True)
-          tracked = set(subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")) - {""}
-          assert tracked == set(names), f"Tracked files differ: {len(tracked)} vs {len(names)}"
-          subprocess.run(["git", "commit", "-m", "Upload all 33,086 original extracted files with complete folders"], check=True, stdout=subprocess.DEVNULL)
+          subprocess.run(["git", "merge", "--no-ff", "-m", "Publish complete game with all 33086 original files and folders", source_commit], check=True, stdout=subprocess.DEVNULL)
+          changes = subprocess.check_output(["git", "diff", "--name-only", source_commit, "HEAD"]).decode().splitlines()
+          assert changes == [".github/workflows/import-complete-archive.yml"], f"Unexpected source differences: {changes}"
+          files = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", "-z", "HEAD"]).decode().split("\0")
+          files = [name for name in files if name and not name.startswith(".github/")]
+          objects = subprocess.check_output(["git", "ls-tree", "-r", "-z", source_commit]).split(b"\0")
+          expected_hashes = {}
+          for item in objects:
+              if item:
+                  metadata, name = item.split(b"\t", 1)
+                  expected_hashes[name.decode()] = metadata.split()[2].decode()
+          assert len(files) == int(os.environ["EXPECTED_ORIGINAL_FILES"]) + 2
+          assert "Degrees of Lewdity.html" in files and "index.html" in files and ".nojekyll" in files
+          assert "img/clothes/neck/collarfamiliar/acc.png" in files
+          assert "img/clothes/neck/collarfamiliar/Acc.png" in files
+          site = temporary / "complete-extracted-site"
+          site.mkdir(exist_ok=True)
+          for name in files:
+              target = site / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(root / name, target)
+              content = target.read_bytes()
+              actual = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest()
+              expected = expected_hashes[name]
+              assert actual == expected, f"File content mismatch: {name}"
           subprocess.run(["git", "push", "origin", "HEAD:main"], check=True)
-          print(f"Verified and uploaded {len(names)} original files, all bytes unchanged.")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write(f"Uploaded all **{len(names):,}** original files with matching SHA-256 hashes and original folder paths.\n")
+              summary.write("Verified all **33,086 original files** with original case-sensitive paths and unchanged contents. Added only index.html and .nojekyll for Pages.\n")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("uploaded=true\n")
 
@@ -95,13 +108,13 @@ jobs:
             await github.rest.git.deleteRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              ref: "heads/archive-transfer-20261101"
+              ref: "heads/complete-site-transfer-20261101"
             });
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload extracted site for Pages
+      - name: Upload complete site for Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/complete-extracted-site
