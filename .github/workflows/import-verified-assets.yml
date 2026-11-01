@@ -1,0 +1,42 @@
+name: Import verified website files
+
+on:
+  push:
+    branches: ["codex/import-homepage-20261101"]
+    paths: [".codex-import/ready.json"]
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and import the checked website files
+        env:
+          IMPORT_COMMIT: "428be9cfc781d2b7a21268c8f1647ed20ee57dd3"
+          IMPORT_PARENT: "da0a901fa1bea6b1ca2cd775dbad61249fae2158"
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(".codex-import")
+          manifest = json.loads((root / "ready.json").read_text())
+          output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "homepage-assets.pack"
+          digest = hashlib.sha256()
+          with output.open("wb") as stream:
+              for item in manifest["chunks"]:
+                  data = (root / item["name"]).read_bytes()
+                  assert len(data) == item["size"], item["name"]
+                  assert hashlib.sha256(data).hexdigest() == item["sha256"], item["name"]
+                  stream.write(data)
+                  digest.update(data)
+          assert digest.hexdigest() == manifest["sha256"], "pack checksum mismatch"
+          print("Verified complete website object pack")
+          PY
+          git index-pack --stdin --fix-thin < "$RUNNER_TEMP/homepage-assets.pack"
+          test "$(git rev-parse "$IMPORT_COMMIT^")" = "$IMPORT_PARENT"
+          git fsck --connectivity-only --no-reflogs "$IMPORT_COMMIT"
+          git push origin "$IMPORT_COMMIT:refs/heads/codex/verified-homepage-20261101"
