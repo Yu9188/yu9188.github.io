@@ -1,0 +1,75 @@
+name: Restore and verify uploaded website assets
+
+on:
+  push:
+    branches: [codex/restore-homepage-20261101]
+    paths: [.archive-import/ready.json]
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify and import uploaded archive objects
+        env:
+          EXPECTED_PACK_SHA256: 2abf66115b85075e39b30e97c2860dfb25e871e28442894d96dad581ed94511e
+          TARGET_TREE: 5f492eb050ca0453d78479730fb0bfd59aad0dfb
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          manifest = json.loads(pathlib.Path('.archive-import/ready.json').read_text())
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'verified-assets.pack'
+          digest = hashlib.sha256()
+          with output.open('wb') as target:
+              for part in manifest['parts']:
+                  data = (pathlib.Path('.archive-import') / part['name']).read_bytes()
+                  assert len(data) == part['bytes'], part['name']
+                  actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+                  assert actual == part['blob'], part['name']
+                  target.write(data)
+                  digest.update(data)
+          assert digest.hexdigest() == os.environ['EXPECTED_PACK_SHA256']
+          with output.open('rb') as source:
+              subprocess.run(['git', 'index-pack', '--stdin'], stdin=source, check=True)
+          subprocess.run(['git', 'fsck', '--connectivity-only', '--no-dangling', os.environ['TARGET_TREE']], check=True)
+          print('Verified all archive objects and the complete website tree.')
+          PY
+      - name: Make verified assets available for publication
+        env:
+          TARGET_TREE: 5f492eb050ca0453d78479730fb0bfd59aad0dfb
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          def git(*args, data=None):
+              return subprocess.check_output(['git', *args], input=data).decode().strip()
+          git('config', 'user.name', 'github-actions[bot]')
+          git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          entries = git('ls-tree', os.environ['TARGET_TREE']) + '\n' + git('ls-tree', 'HEAD', '.github') + '\n'
+          tree = git('mktree', data=entries.encode())
+          commit = git('commit-tree', tree, '-p', 'HEAD', '-m', 'Import verified original website files')
+          git('push', 'origin', commit + ':refs/heads/codex/verified-homepage-20261101')
+          print('Verified asset commit:', commit)
+          PY
+      - name: Remove temporary import branches after publication
+        env:
+          TARGET_TREE: 5f492eb050ca0453d78479730fb0bfd59aad0dfb
+        run: |
+          python - <<'PY'
+          import os, subprocess, time
+          for attempt in range(120):
+              subprocess.run(['git', 'fetch', '--quiet', 'origin', 'main'], check=True)
+              tree = subprocess.check_output(['git', 'rev-parse', 'FETCH_HEAD^{tree}']).decode().strip()
+              if tree == os.environ['TARGET_TREE']:
+                  subprocess.run(['git', 'push', 'origin', '--delete',
+                                  'codex/restore-homepage-20261101',
+                                  'codex/verified-homepage-20261101'], check=True)
+                  print('Temporary import branches removed.')
+                  break
+              time.sleep(5)
+          else:
+              print('Verified assets retained on the temporary branch for publication.')
+          PY
